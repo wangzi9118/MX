@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import re
 import urllib.request
 import urllib.parse
 from playwright.sync_api import sync_playwright
@@ -12,11 +13,16 @@ SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY")
 
 
 def push_serverchan(title, desp):
-    """Server 酱推送（已补全请求头，修复 400 Bad Request）"""
+    """Server 酱推送（过滤 HTML 标签，防止触发 400 错误）"""
     if not SERVERCHAN_KEY:
         return
     url = f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send"
-    data = urllib.parse.urlencode({"title": title[:32], "desp": desp}).encode("utf-8")
+    # 清除 HTML 标签并截断长度
+    clean_desp = re.sub(r"<[^>]+>", "", str(desp))[:500]
+    data = urllib.parse.urlencode({
+        "title": str(title)[:30],
+        "desp": clean_desp
+    }).encode("utf-8")
     headers = {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -42,7 +48,7 @@ def run():
         )
         page = context.new_page()
 
-        # 监听并打印登录接口返回，方便查看具体拒绝原因
+        # 监听并打印登录接口返回
         login_resp_info = {}
 
         def on_response(response):
@@ -81,7 +87,6 @@ def run():
                 time.sleep(1)
 
                 print("[*] 正在等待算力结果...")
-                # 等待“计算中”状态结束
                 try:
                     page.wait_for_function(
                         """() => {
@@ -96,7 +101,7 @@ def run():
             else:
                 print("[-] 提示: 未在页面找到 PoW 安全验证按钮，跳过点击。")
 
-            # 增加延迟等待结果写入
+            # 等待验证状态写入
             print("[*] 正在等待 3 秒以确保验证状态就绪...")
             time.sleep(3)
 
@@ -107,39 +112,70 @@ def run():
             else:
                 page.keyboard.press("Enter")
 
-            # 等待 5 秒观察网络响应或页面弹窗
+            # 等待跳转
             time.sleep(5)
 
-            # 抓取页面弹出的提示信息（SweetAlert/Toast等）
-            page_error = page.evaluate("""() => {
-                const el = document.querySelector('.swal2-html-container, .swal2-title, .toast, .alert, .modal-body, #msg');
-                return el ? el.innerText.trim() : '';
-            }""")
-            if page_error:
-                print(f"[-] 页面弹窗提示: {page_error}")
-
-            # 判断是否成功跳转至用户中心
+            # 判断是否登录成功
             if "/user" in page.url or "用户中心" in page.content():
                 print("[+] 登录成功，已跳转至用户中心！")
             else:
+                page_error = page.evaluate("""() => {
+                    const el = document.querySelector('.swal2-html-container, .swal2-title, .toast, .alert, .modal-body, #msg');
+                    return el ? el.innerText.trim() : '';
+                }""")
                 detail = f"弹窗: {page_error or '无'} | 接口返回: {login_resp_info.get('body', '无响应')}"
                 msg = f"[-] 登录未成功跳转: {detail}"
                 print(msg)
                 push_serverchan("猫熊加速器签到失败", f"登录未成功跳转。\n详情: {detail}")
                 sys.exit(1)
 
-            # 签到处理
+            # ==========================================
+            # 关键处理：清除阻挡操作的公告弹窗
+            # ==========================================
+            print("[*] 正在关闭/清除公告弹窗...")
             time.sleep(2)
+            page.evaluate("""() => {
+                const modal = document.querySelector('#popup-ann-modal, .modal.show');
+                if (modal) modal.remove();
+                const backdrops = document.querySelectorAll('.modal-backdrop');
+                backdrops.forEach(b => b.remove());
+                document.body.classList.remove('modal-open');
+            }""")
+            time.sleep(1)
+
+            # ==========================================
+            # 执行签到（优先直接请求后台签到接口）
+            # ==========================================
             print("[*] 检查并执行签到...")
-            checkin_btn = page.query_selector("button:has-text('签到'), a:has-text('签到'), #checkin")
-            if checkin_btn:
-                checkin_btn.click()
-                time.sleep(3)
-                print("[+] 签到操作已触发！")
-                push_serverchan("猫熊加速器签到成功", "今日签到已完成。")
+            checkin_res = page.evaluate("""async () => {
+                try {
+                    const res = await fetch('/user/checkin', {
+                        method: 'POST',
+                        headers: {
+                            'X-Requested-With': 'XMLHttpRequest'
+                        }
+                    });
+                    return await res.json();
+                } catch (e) {
+                    return { ret: -1, msg: e.toString() };
+                }
+            }""")
+
+            if isinstance(checkin_res, dict) and checkin_res.get("ret") in:
+                msg = checkin_res.get("msg", "无返回说明")
+                print(f"[+] 签到返回: {msg}")
+                push_serverchan("猫熊加速器签到结果", f"签到结果: {msg}")
             else:
-                print("[*] 未找到签到按钮，可能今日已签到。")
-                push_serverchan("猫熊加速器通知", "已成功登录，未找到签到按钮（可能已签到）。")
+                # 备用方案：通过 DOM 强制点击按钮（force=True 忽略遮挡）
+                checkin_btn = page.query_selector("button:has-text('签到'), a:has-text('签到'), #checkin")
+                if checkin_btn:
+                    checkin_btn.click(force=True)
+                    time.sleep(3)
+                    print("[+] 签到按钮已强制点击！")
+                    push_serverchan("猫熊加速器签到", "已成功触发签到。")
+                else:
+                    print("[*] 未找到签到按钮，可能今日已签到。")
+                    push_serverchan("猫熊加速器通知", "已成功登录，未找到签到按钮（可能今日已完成签到）。")
 
         except Exception as e:
             err_msg = f"[-] 运行异常: {str(e)}"
@@ -151,4 +187,3 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
