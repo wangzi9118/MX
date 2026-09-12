@@ -17,7 +17,6 @@ def push_serverchan(title, desp):
     if not SERVERCHAN_KEY:
         return
     url = f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send"
-    # 清除 HTML 标签并截断长度
     clean_desp = re.sub(r"<[^>]+>", "", str(desp))[:500]
     data = urllib.parse.urlencode({
         "title": str(title)[:30],
@@ -42,13 +41,15 @@ def run():
         sys.exit(1)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"]
+        )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = context.new_page()
 
-        # 监听并打印登录接口返回
         login_resp_info = {}
 
         def on_response(response):
@@ -112,10 +113,9 @@ def run():
             else:
                 page.keyboard.press("Enter")
 
-            # 等待跳转
+            # 等待登录跳转
             time.sleep(5)
 
-            # 判断是否登录成功
             if "/user" in page.url or "用户中心" in page.content():
                 print("[+] 登录成功，已跳转至用户中心！")
             else:
@@ -129,9 +129,7 @@ def run():
                 push_serverchan("猫熊加速器签到失败", f"登录未成功跳转。\n详情: {detail}")
                 sys.exit(1)
 
-            # ==========================================
-            # 关键处理：清除阻挡操作的公告弹窗
-            # ==========================================
+            # 清除阻挡操作的公告弹窗
             print("[*] 正在关闭/清除公告弹窗...")
             time.sleep(2)
             page.evaluate("""() => {
@@ -143,9 +141,7 @@ def run():
             }""")
             time.sleep(1)
 
-            # ==========================================
-            # 执行签到（优先直接请求后台签到接口）
-            # ==========================================
+            # 执行签到请求
             print("[*] 检查并执行签到...")
             checkin_res = page.evaluate("""async () => {
                 try {
@@ -161,12 +157,12 @@ def run():
                 }
             }""")
 
-            if isinstance(checkin_res, dict) and checkin_res.get("ret") in:
+            # 修复此处语法错误：补全 (0, 1) 判断范围
+            if isinstance(checkin_res, dict) and checkin_res.get("ret") in (0, 1):
                 msg = checkin_res.get("msg", "无返回说明")
                 print(f"[+] 签到返回: {msg}")
                 push_serverchan("猫熊加速器签到结果", f"签到结果: {msg}")
             else:
-                # 备用方案：通过 DOM 强制点击按钮（force=True 忽略遮挡）
                 checkin_btn = page.query_selector("button:has-text('签到'), a:has-text('签到'), #checkin")
                 if checkin_btn:
                     checkin_btn.click(force=True)
@@ -187,3 +183,4 @@ def run():
 
 
 if __name__ == "__main__":
+    run()
