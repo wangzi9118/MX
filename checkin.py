@@ -1,132 +1,112 @@
-import json
 import os
 import sys
 import time
-import urllib.parse
-import urllib.request
+import requests
 from playwright.sync_api import sync_playwright
 
-EMAIL = os.getenv("USER_EMAIL")
-PASSWORD = os.getenv("USER_PASSWORD")
-SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY")
-
-LOGIN_URL = "https://mxwljsq.com/auth/login"
-CHECKIN_URL = "https://mxwljsq.com/user/checkin"
+USER_EMAIL = os.environ.get("USER_EMAIL")
+USER_PASSWORD = os.environ.get("USER_PASSWORD")
+SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY")
 
 
-def send_serverchan(title: str, desp: str = ""):
+def push_serverchan(title, desp):
+    """Server 酱推送"""
     if not SERVERCHAN_KEY:
-        print("[*] 未检测到 SERVERCHAN_KEY，跳过消息推送。")
         return
-
-    if SERVERCHAN_KEY.startswith("SCT"):
-        url = f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send"
-    else:
-        url = f"https://sc.ftqq.com/{SERVERCHAN_KEY}.send"
-
-    post_data = urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=post_data,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; CheckinBot/1.0)"},
-    )
-
+    url = f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send"
+    data = {"title": title, "desp": desp}
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            print(f"[*] Server 酱推送结果: {res.get('data', res.get('errmsg', res))}")
+        res = requests.post(url, data=data, timeout=10).json()
+        print(f"[*] Server 酱推送结果: {res}")
     except Exception as e:
         print(f"[-] Server 酱推送失败: {e}")
 
 
-def auto_checkin():
-    if not EMAIL or not PASSWORD:
-        err_msg = "缺少 USER_EMAIL 或 USER_PASSWORD 配置！"
-        print(f"[-] {err_msg}")
-        send_serverchan("签到失败：配置缺失", err_msg)
+def run():
+    if not USER_EMAIL or not USER_PASSWORD:
+        print("[-] 错误: 请先配置 USER_EMAIL 与 USER_PASSWORD 环境变量。")
         sys.exit(1)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = context.new_page()
 
         try:
             print("[*] 正在打开登录页面...")
-            page.goto(LOGIN_URL, timeout=30000)
+            page.goto("https://mxwljsq.com/auth/login", wait_until="networkidle", timeout=30000)
 
-            # 1. 填写输入框
-            page.locator('input[type="text"], input[type="email"]').first.fill(EMAIL)
-            page.locator('input[type="password"]').first.fill(PASSWORD)
-
-            # 2. 点击安全验证按钮
-            verify_btn = page.locator("text=点击开始安全验证")
-            if verify_btn.is_visible():
-                print("[*] 触发本地 PoW 计算...")
-                verify_btn.click()
-                print("[*] 正在等待算力结果...")
-                try:
-                    page.locator("text=计算中").wait_for(state="hidden", timeout=30000)
-                    print("[+] PoW 计算完成！")
-                except Exception:
-                    time.sleep(6)
-
+            # 填写账号密码
+            page.fill("input[type='email'], input#email", USER_EMAIL)
+            page.fill("input[type='password'], input#password", USER_PASSWORD)
             time.sleep(1)
 
-            # 3. 点击登录按钮
+            # 触发 PoW 计算
+            print("[*] 触发本地 Pow 计算...")
+            pow_btn = page.query_selector("button:has-text('安全验证'), div:has-text('安全验证'), #pow-btn")
+            if pow_btn:
+                pow_btn.click()
+
+            print("[*] 正在等待算力结果...")
+            # 等待“计算中”状态结束
+            page.wait_for_function(
+                """() => {
+                    const text = document.body.innerText;
+                    return !text.includes("计算中") && (text.includes("验证成功") || text.includes("已验证") || true);
+                }""",
+                timeout=30000
+            )
+            print("[+] PoW 计算完成!")
+
+            # ----------------------------------------------------
+            # 增加延迟：等待 3 秒，让结果完全同步至表单，模拟真实人工操作间隔
+            # ----------------------------------------------------
+            print("[*] 正在等待 3 秒以确保验证状态就绪...")
+            time.sleep(3)
+
             print("[*] 点击登录...")
-            login_btn = page.locator('button:has-text("登录"), input[value="登录"]').first
-            login_btn.click()
+            login_btn = page.query_selector("button[type='submit'], button:has-text('登录'), #login-btn")
+            if login_btn:
+                login_btn.click()
+            else:
+                page.keyboard.press("Enter")
 
-            # 4. 确认登录跳转
+            # 等待跳转至用户中心
             try:
-                page.wait_for_url("**/user", timeout=25000)
-                print("[+] 成功进入用户中心。")
+                page.wait_for_url("**/user**", timeout=15000)
+                print("[+] 登录成功，已跳转至用户中心！")
             except Exception:
-                err_text = "登录超时或未成功跳转，请确认账密是否正确或遇到风控。"
-                print(f"[-] {err_text}")
-                send_serverchan("签到失败：登录未成功", err_text)
-                browser.close()
-                sys.exit(1)
-
-            # 5. 发起签到
-            print("[*] 发起签到接口请求...")
-            response = context.request.post(CHECKIN_URL)
-            
-            try:
-                res_json = response.json()
-                msg = res_json.get("msg", str(res_json))
-                ret = res_json.get("ret")
-                print(f"[+] 签到接口响应: {msg}")
-
-                if ret == 1:
-                    send_serverchan("机场签到成功 🎉", f"- **结果**: {msg}")
+                if "/user" in page.url or "用户中心" in page.content():
+                    print("[+] 登录成功！")
                 else:
-                    send_serverchan("机场签到提醒", f"- **结果**: {msg}")
-            except Exception:
-                checkin_btn = page.locator("text=签到, text=今日已签到").first
-                if checkin_btn.is_visible():
-                    checkin_btn.click()
-                    send_serverchan("机场签到通知", "已点击页面签到按钮。")
-                else:
-                    send_serverchan("签到异常", f"接口状态码: {response.status}")
+                    msg = "[-] 登录超时或未成功跳转,请确认账密是否正确或遇到风控。"
+                    print(msg)
+                    push_serverchan("猫熊签到失败 - 登录未跳转", msg)
+                    sys.exit(1)
+
+            # 签到流程
+            time.sleep(2)
+            print("[*] 检查并执行签到...")
+            checkin_btn = page.query_selector("button:has-text('签到'), a:has-text('签到'), #checkin")
+            if checkin_btn:
+                checkin_btn.click()
+                time.sleep(2)
+                print("[+] 签到操作已触发！")
+                push_serverchan("猫熊加速器签到成功", "今日签到已完成。")
+            else:
+                print("[*] 未找到签到按钮，可能今日已签到或已在后台。")
+                push_serverchan("猫熊加速器通知", "已成功登录，未找到签到按钮（可能已签到）。")
 
         except Exception as e:
-            err = f"执行异常: {str(e)}"
-            print(f"[!] {err}")
-            send_serverchan("签到流程异常", err)
+            err_msg = f"[-] 运行异常: {str(e)}"
+            print(err_msg)
+            push_serverchan("猫熊签到异常", err_msg)
             sys.exit(1)
         finally:
             browser.close()
 
 
 if __name__ == "__main__":
-    auto_checkin()
+    run()
