@@ -12,12 +12,16 @@ SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY")
 
 
 def push_serverchan(title, desp):
-    """Server 酱推送（使用内置 urllib，免装 requests）"""
+    """Server 酱推送（已补全请求头，修复 400 Bad Request）"""
     if not SERVERCHAN_KEY:
         return
     url = f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send"
-    data = urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
+    data = urllib.parse.urlencode({"title": title[:32], "desp": desp}).encode("utf-8")
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    }
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             res = json.loads(resp.read().decode("utf-8"))
@@ -38,56 +42,91 @@ def run():
         )
         page = context.new_page()
 
+        # 监听并打印登录接口返回，方便查看具体拒绝原因
+        login_resp_info = {}
+
+        def on_response(response):
+            if "/auth/login" in response.url:
+                try:
+                    text = response.text()
+                    login_resp_info["status"] = response.status
+                    login_resp_info["body"] = text
+                    print(f"[*] 登录接口返回: 状态码 {response.status} -> {text}")
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+
         try:
             print("[*] 正在打开登录页面...")
             page.goto("https://mxwljsq.com/auth/login", wait_until="networkidle", timeout=30000)
 
-            # 输入账密
+            # 填写账密
             page.fill("input[type='email'], input#email", USER_EMAIL)
             page.fill("input[type='password'], input#password", USER_PASSWORD)
             time.sleep(1)
 
             # 触发 PoW 计算
-            print("[*] 触发本地 Pow 计算...")
-            pow_btn = page.query_selector("button:has-text('安全验证'), div:has-text('安全验证'), #pow-btn")
-            if pow_btn:
-                pow_btn.click()
-
-            print("[*] 正在等待算力结果...")
-            page.wait_for_function(
-                """() => {
-                    const text = document.body.innerText;
-                    return !text.includes("计算中") && (text.includes("验证成功") || text.includes("已验证") || true);
-                }""",
-                timeout=30000
+            print("[*] 寻找并触发本地 PoW 计算...")
+            pow_btn = (
+                page.query_selector("text='点击开始安全验证'")
+                or page.query_selector("text='安全验证'")
+                or page.query_selector("button:has-text('安全验证')")
+                or page.query_selector(".captcha-btn, #pow-btn, #captcha")
             )
-            print("[+] PoW 计算完成!")
 
-            # ----------------------------------------------------
-            # 增加延迟：等待 3 秒确保算力值完全绑定
-            # ----------------------------------------------------
+            if pow_btn:
+                print("[*] 已找到验证按钮，正在点击触发...")
+                pow_btn.click()
+                time.sleep(1)
+
+                print("[*] 正在等待算力结果...")
+                # 等待“计算中”状态结束
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const text = document.body.innerText;
+                            return !text.includes("计算中") && !text.includes("正在加载验证模块");
+                        }""",
+                        timeout=35000
+                    )
+                    print("[+] PoW 计算完成!")
+                except Exception:
+                    print("[-] 等待 PoW 计算状态超时，尝试继续执行...")
+            else:
+                print("[-] 提示: 未在页面找到 PoW 安全验证按钮，跳过点击。")
+
+            # 增加延迟等待结果写入
             print("[*] 正在等待 3 秒以确保验证状态就绪...")
             time.sleep(3)
 
             print("[*] 点击登录...")
-            login_btn = page.query_selector("button[type='submit'], button:has-text('登录'), #login-btn")
+            login_btn = page.query_selector("button[type='submit'], button:has-text('登录'), #login-btn, #login")
             if login_btn:
                 login_btn.click()
             else:
                 page.keyboard.press("Enter")
 
-            # 等待跳转
-            try:
-                page.wait_for_url("**/user**", timeout=15000)
+            # 等待 5 秒观察网络响应或页面弹窗
+            time.sleep(5)
+
+            # 抓取页面弹出的提示信息（SweetAlert/Toast等）
+            page_error = page.evaluate("""() => {
+                const el = document.querySelector('.swal2-html-container, .swal2-title, .toast, .alert, .modal-body, #msg');
+                return el ? el.innerText.trim() : '';
+            }""")
+            if page_error:
+                print(f"[-] 页面弹窗提示: {page_error}")
+
+            # 判断是否成功跳转至用户中心
+            if "/user" in page.url or "用户中心" in page.content():
                 print("[+] 登录成功，已跳转至用户中心！")
-            except Exception:
-                if "/user" in page.url or "用户中心" in page.content():
-                    print("[+] 登录成功！")
-                else:
-                    msg = "[-] 登录超时或未成功跳转,请确认账密是否正确或遇到风控。"
-                    print(msg)
-                    push_serverchan("猫熊签到失败 - 登录未跳转", msg)
-                    sys.exit(1)
+            else:
+                detail = f"弹窗: {page_error or '无'} | 接口返回: {login_resp_info.get('body', '无响应')}"
+                msg = f"[-] 登录未成功跳转: {detail}"
+                print(msg)
+                push_serverchan("猫熊加速器签到失败", f"登录未成功跳转。\n详情: {detail}")
+                sys.exit(1)
 
             # 签到处理
             time.sleep(2)
@@ -95,11 +134,11 @@ def run():
             checkin_btn = page.query_selector("button:has-text('签到'), a:has-text('签到'), #checkin")
             if checkin_btn:
                 checkin_btn.click()
-                time.sleep(2)
+                time.sleep(3)
                 print("[+] 签到操作已触发！")
                 push_serverchan("猫熊加速器签到成功", "今日签到已完成。")
             else:
-                print("[*] 未找到签到按钮，可能今日已签到或已在后台。")
+                print("[*] 未找到签到按钮，可能今日已签到。")
                 push_serverchan("猫熊加速器通知", "已成功登录，未找到签到按钮（可能已签到）。")
 
         except Exception as e:
